@@ -97,6 +97,8 @@ pub trait Backend {
 }
 
 #[cfg(all(feature = "wayland", target_os = "linux"))]
+mod virtual_pointer;
+#[cfg(all(feature = "wayland", target_os = "linux"))]
 pub mod wayland;
 
 #[cfg(all(feature = "x11", target_os = "linux"))]

@@ -32,6 +32,7 @@ use wayland_protocols_wlr::{
 
 use anyhow::{bail, Context, Result};
 
+use super::virtual_pointer::{UinputPointer, VirtualPointer};
 use super::{Backend, Capture, KeyEvent};
 use crate::config::{config, Key};
 
@@ -104,6 +105,16 @@ impl WaylandBackend {
                 .context("waiting for configure")?;
         }
 
+        // Without wlr-virtual-pointer (e.g. COSMIC), fall back to a uinput
+        // pointer. Create it now rather than on first use: the compositor
+        // needs a moment to notice a new input device.
+        if state.vp_manager.is_none() {
+            match UinputPointer::new() {
+                Ok(vp) => state.vp = Some(VirtualPointer::Uinput(vp)),
+                Err(e) => eprintln!("no virtual pointer available, clicking disabled: {e:#}"),
+            }
+        }
+
         let mut backend = WaylandBackend { state, eq, qh };
         backend.present_empty()?;
         Ok(backend)
@@ -114,11 +125,13 @@ impl WaylandBackend {
             return;
         }
         if let Some(manager) = &self.state.vp_manager {
-            self.state.vp = Some(manager.create_virtual_pointer_with_output(
-                self.state.seat.as_ref(),
-                self.state.current_output.as_ref(),
-                &self.qh,
-                (),
+            self.state.vp = Some(VirtualPointer::Wlr(
+                manager.create_virtual_pointer_with_output(
+                    self.state.seat.as_ref(),
+                    self.state.current_output.as_ref(),
+                    &self.qh,
+                    (),
+                ),
             ));
         }
     }
@@ -729,7 +742,7 @@ struct WaylandState {
     layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
     seat: Option<wl_seat::WlSeat>,
     vp_manager: Option<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>,
-    vp: Option<zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1>,
+    vp: Option<VirtualPointer>,
     wl_pointer: Option<wl_pointer::WlPointer>,
 
     screen_w: u32,
