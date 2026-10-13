@@ -6,6 +6,7 @@ use xkbcommon::xkb;
 
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 
+use wayland_client::backend::WaylandError;
 use wayland_client::protocol::wl_pointer::{Axis, AxisSource};
 use wayland_client::{
     delegate_noop,
@@ -555,7 +556,13 @@ impl WaylandBackend {
         let ready = poll(&mut pfds, timeout).context("poll wayland fd")?;
 
         if ready > 0 {
-            guard.read().context("read wayland events")?;
+            match guard.read() {
+                Ok(_) => {}
+                // poll() can report readiness for data another read already
+                // consumed; that is not an error, there is just nothing to do.
+                Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e).context("read wayland events"),
+            }
             self.eq
                 .dispatch_pending(&mut self.state)
                 .context("dispatch_pending after read")?;
