@@ -16,8 +16,17 @@
   ];
   libsPath = lib.makeLibraryPath libs;
 
+  # cleanCargoSource keeps only Rust/Cargo files; the vendored protocol XML in
+  # protocols/ is read at compile time by wayland-scanner, so keep it too.
+  protocolXmlFilter = path: _type: builtins.match ".*/protocols/.*\\.xml" path != null;
+  src = lib.cleanSourceWith {
+    src = unfilteredRoot;
+    filter = path: type: protocolXmlFilter path type || craneLib.filterCargoSources path type;
+    name = "source";
+  };
+
   commonArgs = {
-    src = craneLib.cleanCargoSource unfilteredRoot;
+    inherit src;
 
     strictDeps = true;
 

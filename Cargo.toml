@@ -13,7 +13,7 @@ exclude = ["example.gif", "target/*", "nix/*", "flake.*", "shell.nix", "install.
 
 [features]
 default = ["wayland", "x11"]
-wayland = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr", "dep:tempfile", "dep:xkbcommon"]
+wayland = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr", "dep:wayland-scanner", "dep:tempfile", "dep:xkbcommon"]
 x11 = ["dep:x11rb", "dep:xkbcommon"]
 
 [dependencies]
@@ -30,6 +30,7 @@ nix = { version = "0.31", features = ["fs", "poll", "ioctl"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 wayland-client = { version = "0.31", optional = true }
 wayland-protocols = { version = "0.32", features = ["client", "staging"], optional = true }
+wayland-scanner = { version = "0.31", optional = true }
 wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
 tempfile = { version = "3", optional = true }
 x11rb = { version = "0.13", features = ["xkb", "xtest"], optional = true }

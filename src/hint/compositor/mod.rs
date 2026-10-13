@@ -6,6 +6,8 @@
 //! absolute-screen rectangles when detected, else `None`. With no provider,
 //! [`snapshot`] is empty and coordinates are used unshifted (correct on X11).
 
+#[cfg(feature = "wayland")]
+mod cosmic;
 mod hyprland;
 mod sway;
 
@@ -38,7 +40,8 @@ impl CompositorSnapshot {
 
 /// Window geometry from the first provider whose compositor is running.
 pub fn snapshot() -> CompositorSnapshot {
-    hyprland::snapshot()
-        .or_else(sway::snapshot)
-        .unwrap_or_default()
+    let snapshot = hyprland::snapshot().or_else(sway::snapshot);
+    #[cfg(feature = "wayland")]
+    let snapshot = snapshot.or_else(cosmic::snapshot);
+    snapshot.unwrap_or_default()
 }
