@@ -15,6 +15,15 @@ use wayland_client::{
     },
     Connection, Dispatch, EventQueue, QueueHandle, WEnum,
 };
+use wayland_protocols::ext::{
+    image_capture_source::v1::client::{
+        ext_image_capture_source_v1, ext_output_image_capture_source_manager_v1,
+    },
+    image_copy_capture::v1::client::{
+        ext_image_copy_capture_frame_v1, ext_image_copy_capture_manager_v1,
+        ext_image_copy_capture_session_v1,
+    },
+};
 use wayland_protocols_wlr::{
     layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1},
     screencopy::v1::client::{zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1},
@@ -79,6 +88,9 @@ impl WaylandBackend {
             held: None,
             pointer_pos: None,
             screencopy: None,
+            ext_capture: None,
+            ext_copy_manager: None,
+            ext_source_manager: None,
         };
 
         eq.roundtrip(&mut state).context("initial roundtrip")?;
@@ -187,6 +199,12 @@ impl Backend for WaylandBackend {
 
     fn capture_screen(&mut self) -> Result<Capture> {
         self.present_empty()?;
+        if self.state.screencopy_manager.is_none() {
+            if self.state.ext_copy_manager.is_some() && self.state.ext_source_manager.is_some() {
+                return self.capture_screen_ext();
+            }
+            bail!("zwlr_screencopy_manager_v1 not available");
+        }
         let manager = self
             .state
             .screencopy_manager
@@ -519,6 +537,142 @@ impl Backend for WaylandBackend {
 }
 
 impl WaylandBackend {
+    /// Capture via `ext-image-copy-capture-v1` (used by COSMIC and others that
+    /// lack `wlr-screencopy`).
+    fn capture_screen_ext(&mut self) -> Result<Capture> {
+        let copy_manager = self
+            .state
+            .ext_copy_manager
+            .clone()
+            .context("ext copy manager")?;
+        let source_manager = self
+            .state
+            .ext_source_manager
+            .clone()
+            .context("ext source manager")?;
+        let output = self
+            .state
+            .current_output
+            .clone()
+            .context("no Wayland output is associated with the overlay")?;
+
+        self.state.ext_capture = Some(ExtCaptureState::default());
+        let source = source_manager.create_source(&output, &self.qh, ());
+        let session = copy_manager.create_session(
+            &source,
+            ext_image_copy_capture_manager_v1::Options::empty(),
+            &self.qh,
+            (),
+        );
+
+        let capture = self.capture_ext_session(&session);
+        session.destroy();
+        source.destroy();
+        self.state.ext_capture = None;
+        capture
+    }
+
+    /// Capture one frame from an established session. The caller destroys the
+    /// session and source, so every error path here is covered.
+    fn capture_ext_session(
+        &mut self,
+        session: &ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1,
+    ) -> Result<Capture> {
+        self.wait_for_ext(
+            |c| c.session_done || c.stopped,
+            "waiting for capture session",
+        )?;
+        let c = self
+            .state
+            .ext_capture
+            .as_ref()
+            .context("capture state missing")?;
+        if c.stopped {
+            bail!("ext-image-copy-capture session stopped");
+        }
+        let (width, height) = c.size;
+        let format = c
+            .formats
+            .iter()
+            .copied()
+            .find(|f| is_supported_screencopy_format(*f))
+            .with_context(|| {
+                format!(
+                    "capture offered no supported wl_shm format (got {:?})",
+                    c.formats
+                )
+            })?;
+        if width == 0 || height == 0 {
+            bail!("capture session reported an empty buffer size");
+        }
+        let stride = width * 4;
+        let size = stride as usize * height as usize;
+        let mut file = tempfile::tempfile().context("create capture shm tempfile")?;
+        file.set_len(size as u64)
+            .context("resize capture shm tempfile")?;
+        let shm = self.state.shm.as_ref().context("wl_shm not available")?;
+        let pool = shm.create_pool(file.as_fd(), size as i32, &self.qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            width as i32,
+            height as i32,
+            stride as i32,
+            format,
+            &self.qh,
+            (),
+        );
+
+        let frame = session.create_frame(&self.qh, ());
+        frame.attach_buffer(&buffer);
+        frame.damage_buffer(0, 0, width as i32, height as i32);
+        frame.capture();
+        let waited = self
+            .state
+            .conn
+            .flush()
+            .context("flush capture request")
+            .and_then(|()| self.wait_for_ext(|c| c.result.is_some(), "waiting for capture frame"));
+        let result = self.state.ext_capture.as_ref().and_then(|c| c.result);
+        frame.destroy();
+        buffer.destroy();
+        pool.destroy();
+        waited?;
+        if !matches!(result, Some(true)) {
+            bail!("ext-image-copy-capture frame failed");
+        }
+
+        file.seek(SeekFrom::Start(0))
+            .context("rewind capture shm file")?;
+        let mut data = vec![0u8; size];
+        file.read_exact(&mut data)
+            .context("read capture shm buffer")?;
+        let params = ScreencopyBufferParams {
+            format,
+            width,
+            height,
+            stride,
+        };
+        let bgra = convert_screencopy_buffer(&data, params, 0)?;
+        Ok(Capture {
+            bgra,
+            w: width,
+            h: height,
+        })
+    }
+
+    fn wait_for_ext(
+        &mut self,
+        ready: impl Fn(&ExtCaptureState) -> bool,
+        context: &'static str,
+    ) -> Result<()> {
+        while !self.state.ext_capture.as_ref().is_some_and(&ready) {
+            self.eq
+                .blocking_dispatch(&mut self.state)
+                .with_context(|| format!("dispatch wayland events while {context}"))?;
+        }
+        Ok(())
+    }
+
     fn wait_for_screencopy(
         &mut self,
         ready: impl Fn(&ScreencopyState) -> bool,
@@ -588,6 +742,10 @@ struct WaylandState {
     held: Option<HeldKey>,
     pointer_pos: Option<(u32, u32)>,
     screencopy: Option<ScreencopyState>,
+    ext_capture: Option<ExtCaptureState>,
+    ext_copy_manager: Option<ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1>,
+    ext_source_manager:
+        Option<ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1>,
 }
 
 #[derive(Clone, Copy)]
@@ -613,6 +771,16 @@ struct ScreencopyState {
     buffer_done: bool,
     flags: u32,
     done: Option<ScreencopyDone>,
+}
+
+#[derive(Default)]
+struct ExtCaptureState {
+    size: (u32, u32),
+    formats: Vec<wl_shm::Format>,
+    session_done: bool,
+    stopped: bool,
+    /// `Some(true)` on ready, `Some(false)` on failed.
+    result: Option<bool>,
 }
 
 /// `zwlr_screencopy_frame_v1` flag bit indicating the buffer is stored bottom-up.
@@ -762,6 +930,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
             }
             "zwlr_screencopy_manager_v1" => {
                 state.screencopy_manager = Some(registry.bind(name, version.min(3), qh, ()));
+            }
+            "ext_image_copy_capture_manager_v1" => {
+                state.ext_copy_manager = Some(registry.bind(name, 1, qh, ()));
+            }
+            "ext_output_image_capture_source_manager_v1" => {
+                state.ext_source_manager = Some(registry.bind(name, 1, qh, ()));
             }
             "zwlr_virtual_pointer_manager_v1" => {
                 state.vp_manager = Some(registry.bind(name, version.min(2), qh, ()));
@@ -947,6 +1121,56 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for WaylandSt
     }
 }
 
+impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, ()>
+    for WaylandState
+{
+    fn event(
+        state: &mut Self,
+        _: &ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1,
+        event: ext_image_copy_capture_session_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use ext_image_copy_capture_session_v1::Event;
+        let Some(c) = state.ext_capture.as_mut() else {
+            return;
+        };
+        match event {
+            Event::BufferSize { width, height } => c.size = (width, height),
+            Event::ShmFormat {
+                format: WEnum::Value(format),
+            } => c.formats.push(format),
+            Event::Done => c.session_done = true,
+            Event::Stopped => c.stopped = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1,
+        event: ext_image_copy_capture_frame_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(c) = state.ext_capture.as_mut() else {
+            return;
+        };
+        match event {
+            ext_image_copy_capture_frame_v1::Event::Ready => c.result = Some(true),
+            ext_image_copy_capture_frame_v1::Event::Failed { .. } => c.result = Some(false),
+            _ => {}
+        }
+    }
+}
+
+delegate_noop!(WaylandState: ignore ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1);
+delegate_noop!(WaylandState: ignore ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1);
+delegate_noop!(WaylandState: ignore ext_image_capture_source_v1::ExtImageCaptureSourceV1);
 delegate_noop!(WaylandState: ignore wl_compositor::WlCompositor);
 delegate_noop!(WaylandState: ignore wl_region::WlRegion);
 delegate_noop!(WaylandState: ignore wl_output::WlOutput);
@@ -1133,4 +1357,96 @@ fn convert_screencopy_buffer(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(
+        format: wl_shm::Format,
+        width: u32,
+        height: u32,
+        stride: u32,
+    ) -> ScreencopyBufferParams {
+        ScreencopyBufferParams {
+            format,
+            width,
+            height,
+            stride,
+        }
+    }
+
+    #[test]
+    fn argb_is_copied_unchanged() {
+        let data = [1, 2, 3, 4, 5, 6, 7, 8];
+        let out = convert_screencopy_buffer(&data, params(wl_shm::Format::Argb8888, 2, 1, 8), 0);
+        assert_eq!(out.unwrap(), data);
+    }
+
+    #[test]
+    fn xrgb_forces_opaque_alpha() {
+        let data = [1, 2, 3, 0, 5, 6, 7, 0];
+        let out = convert_screencopy_buffer(&data, params(wl_shm::Format::Xrgb8888, 2, 1, 8), 0);
+        assert_eq!(out.unwrap(), [1, 2, 3, 0xFF, 5, 6, 7, 0xFF]);
+    }
+
+    #[test]
+    fn abgr_swaps_red_and_blue_keeping_alpha() {
+        let data = [1, 2, 3, 4];
+        let out = convert_screencopy_buffer(&data, params(wl_shm::Format::Abgr8888, 1, 1, 4), 0);
+        assert_eq!(out.unwrap(), [3, 2, 1, 4]);
+    }
+
+    #[test]
+    fn xbgr_swaps_red_and_blue_and_forces_opaque_alpha() {
+        let data = [1, 2, 3, 0];
+        let out = convert_screencopy_buffer(&data, params(wl_shm::Format::Xbgr8888, 1, 1, 4), 0);
+        assert_eq!(out.unwrap(), [3, 2, 1, 0xFF]);
+    }
+
+    #[test]
+    fn y_invert_flips_rows() {
+        let data = [1, 1, 1, 1, 2, 2, 2, 2];
+        let out = convert_screencopy_buffer(
+            &data,
+            params(wl_shm::Format::Argb8888, 1, 2, 4),
+            SCREENCOPY_Y_INVERT,
+        );
+        assert_eq!(out.unwrap(), [2, 2, 2, 2, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn row_padding_is_skipped() {
+        // Stride of 8 bytes for a 1-pixel-wide image: 4 bytes of padding per row.
+        let data = [1, 2, 3, 4, 9, 9, 9, 9, 5, 6, 7, 8, 9, 9, 9, 9];
+        let out = convert_screencopy_buffer(&data, params(wl_shm::Format::Argb8888, 1, 2, 8), 0);
+        assert_eq!(out.unwrap(), [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn short_buffer_is_rejected() {
+        let data = [0u8; 7];
+        assert!(
+            convert_screencopy_buffer(&data, params(wl_shm::Format::Argb8888, 2, 1, 8), 0).is_err()
+        );
+    }
+
+    #[test]
+    fn stride_smaller_than_a_row_is_rejected() {
+        let data = [0u8; 16];
+        assert!(
+            convert_screencopy_buffer(&data, params(wl_shm::Format::Argb8888, 2, 2, 4), 0).is_err()
+        );
+    }
+
+    #[test]
+    fn unsupported_format_is_rejected() {
+        let data = [0u8; 4];
+        assert!(
+            convert_screencopy_buffer(&data, params(wl_shm::Format::Rgb565, 1, 1, 4), 0).is_err()
+        );
+        assert!(!is_supported_screencopy_format(wl_shm::Format::Rgb565));
+        assert!(is_supported_screencopy_format(wl_shm::Format::Xrgb8888));
+    }
 }

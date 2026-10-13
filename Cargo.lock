@@ -1523,6 +1523,7 @@ dependencies = [
  "tempfile",
  "toml",
  "wayland-client",
+ "wayland-protocols",
  "wayland-protocols-wlr",
  "x11rb",
  "xkbcommon",

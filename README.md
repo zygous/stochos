@@ -8,7 +8,7 @@ Keyboard-driven mouse control overlay for Wayland, X11, and macOS. OSS alternati
 
 Displays a letter grid over your screen. Type a two-key combo to jump to a cell, refine with a sub-grid key, then act. Runs once per invocation (no daemon).
 
-**Wayland:** Tested on **Hyprland**. Should work on any wlroots-based compositor with `zwlr_layer_shell_v1` and `zwlr_virtual_pointer_v1`.
+**Wayland:** Tested on **Hyprland**. Should work on any wlroots-based compositor with `zwlr_layer_shell_v1` and `zwlr_virtual_pointer_v1`. Hint mode's screen capture uses `zwlr_screencopy_v1`, or `ext-image-copy-capture-v1` where that is missing (e.g. COSMIC).
 
 **X11:** Tested on **i3**. Should work on any X11 window manager with the XTest extension.
 
